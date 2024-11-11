@@ -26,6 +26,4 @@ app.use('/api/productos', productosRoute);
 
 app.listen(port,() => {
     console.log('Listen on port ' + port);
-    // console.log(process.env.GOOGLE_APPLICATION_CREDENTIALS);
-    
 })
