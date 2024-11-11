@@ -1,111 +1,67 @@
 const express = require('express');
 const router = express.Router();
-const { db } = require('../config/conection');
+const poolPromise = require('../config/conection'); // Importa la promesa de la pool
 
 // Ruta para registrar una venta con varios pedidos
-router.post('/registrar', (req, res) => {
-  const { nombre_cliente, id_vendedor, pedidos } = req.body;
+router.post('/registrar', async (req, res) => {
+  try {
+    const db = await poolPromise; // Espera a que la pool esté lista
+    const { nombre_cliente, id_vendedor, pedidos } = req.body;
 
-  if (!pedidos || pedidos.length === 0) {
-    return res.status(400).json({ message: 'Debe proporcionar al menos un pedido.' });
-  }
-
-  // Insertar la venta primero con estado 'iniciado'
-  const sqlInsertVenta = 
-    'INSERT INTO Venta (fecha, nombre_cliente, fk_id_vendedor, estado) VALUES (NOW(), ?, ?, \'iniciado\');';
-
-  db.query(sqlInsertVenta, [nombre_cliente, id_vendedor], (err, result) => {
-    if (err) {
-      return res.status(500).json({ error: err.code + ': ' + err.sqlMessage });
+    if (!pedidos || pedidos.length === 0) {
+      return res.status(400).json({ message: 'Debe proporcionar al menos un pedido.' });
     }
 
-    const ventaId = result.insertId;
+    // Insertar la venta primero con estado 'iniciado'
+    const sqlInsertVenta = 'INSERT INTO Venta (fecha, nombre_cliente, fk_id_vendedor, estado) VALUES (NOW(), ?, ?, \'iniciado\');';
+    const [ventaResult] = await db.query(sqlInsertVenta, [nombre_cliente, id_vendedor]);
+    const ventaId = ventaResult.insertId;
 
     // Verificar stock para todos los pedidos antes de registrarlos
-    const stockCheckPromises = pedidos.map(pedido => {
+    for (const pedido of pedidos) {
       const { id_producto, cantidad } = pedido;
+      const [stockResult] = await db.query('SELECT stock FROM Producto WHERE id_producto = ?;', [id_producto]);
 
-      return new Promise((resolve, reject) => {
-        const sqlCheckStock = 'SELECT stock FROM Producto WHERE id_producto = ?;';
-        db.query(sqlCheckStock, [id_producto], (err, result) => {
-          if (err) {
-            reject(err);
-          } else if (result.length === 0 || result[0].stock < cantidad) {
-            reject(new Error('Stock insuficiente para el producto ID: ' + id_producto));
-          } else {
-            resolve();
-          }
-        });
-      });
-    });
+      if (stockResult.length === 0 || stockResult[0].stock < cantidad) {
+        await db.query('UPDATE Venta SET estado = \'cancelado\' WHERE id_venta = ?;', [ventaId]);
+        return res.status(400).json({ message: `Stock insuficiente para el producto ID: ${id_producto}` });
+      }
+    }
 
-    Promise.all(stockCheckPromises)
-      .then(() => {
-        // Si todos los productos tienen suficiente stock, registrar los pedidos y actualizar el stock
-        const pedidosPromises = pedidos.map(pedido => {
-          const { id_producto, cantidad } = pedido;
+    // Registrar los pedidos y actualizar el stock
+    for (const pedido of pedidos) {
+      const { id_producto, cantidad } = pedido;
+      await db.query('INSERT INTO Pedido (cantidad, fk_id_producto, fk_id_venta) VALUES (?, ?, ?);', [cantidad, id_producto, ventaId]);
+      await db.query('UPDATE Producto SET stock = stock - ? WHERE id_producto = ?;', [cantidad, id_producto]);
+    }
 
-          return new Promise((resolve, reject) => {
-            const sqlInsertPedido = 
-              'INSERT INTO Pedido (cantidad, fk_id_producto, fk_id_venta) VALUES (?, ?, ?);';
-            db.query(sqlInsertPedido, [cantidad, id_producto, ventaId], (err, result) => {
-              if (err) {
-                reject(err);
-              } else {
-                const sqlUpdateStock = 'UPDATE Producto SET stock = stock - ? WHERE id_producto = ?;';
-                db.query(sqlUpdateStock, [cantidad, id_producto], (err) => {
-                  if (err) {
-                    reject(err);
-                  } else {
-                    resolve(result);
-                  }
-                });
-              }
-            });
-          });
-        });
+    // Actualizar el estado de la venta a 'completado'
+    await db.query('UPDATE Venta SET estado = \'completado\' WHERE id_venta = ?;', [ventaId]);
+    res.status(201).json({ message: 'Venta y pedidos registrados exitosamente', ventaId });
 
-        return Promise.all(pedidosPromises);
-      })
-      .then(() => {
-        const sqlUpdateVenta = 'UPDATE Venta SET estado = \'completado\' WHERE id_venta = ?;';
-        db.query(sqlUpdateVenta, [ventaId], (err) => {
-          if (err) {
-            res.status(500).json({ error: err.code + ': ' + err.sqlMessage });
-          } else {
-            res.status(201).json({ message: 'Venta y pedidos registrados exitosamente', ventaId });
-          }
-        });
-      })
-      .catch(err => {
-        // Si hay un error de stock, actualizar el estado de la venta a 'cancelado' sin registrar pedidos
-        const sqlUpdateVenta = 'UPDATE Venta SET estado = \'cancelado\' WHERE id_venta = ?;';
-        db.query(sqlUpdateVenta, [ventaId], () => {
-          res.status(200).json({ message: 'Venta registrada pero cancelada por falta de stock', ventaId });
-        });
-      });
-  });
+  } catch (err) {
+    console.error('Error al registrar la venta:', err);
+    res.status(500).json({ error: 'Error al registrar la venta' });
+  }
 });
 
 // Ruta para obtener una venta específica por ID
-router.get('/get-venta/:id', (req, res) => {
-  const ventaId = req.params.id;
+router.get('/get-venta/:id', async (req, res) => {
+  try {
+    const db = await poolPromise; // Espera a que la pool esté lista
+    const ventaId = req.params.id;
 
-  const sqlSelectVenta = `
-    SELECT v.id_venta, v.fecha, v.nombre_cliente, ven.nombre AS vendedor,
-           p.nombre AS producto, p.descripcion, ped.cantidad, p.precio, v.estado
-    FROM Venta v
-    LEFT JOIN Pedido ped ON v.id_venta = ped.fk_id_venta
-    LEFT JOIN Producto p ON ped.fk_id_producto = p.id_producto
-    LEFT JOIN Vendedor ven ON v.fk_id_vendedor = ven.id_vendedor
-    WHERE v.id_venta = ?;
-  `;
+    const sqlSelectVenta = `
+      SELECT v.id_venta, v.fecha, v.nombre_cliente, ven.nombre AS vendedor,
+             p.nombre AS producto, p.descripcion, ped.cantidad, p.precio, v.estado
+      FROM Venta v
+      LEFT JOIN Pedido ped ON v.id_venta = ped.fk_id_venta
+      LEFT JOIN Producto p ON ped.fk_id_producto = p.id_producto
+      LEFT JOIN Vendedor ven ON v.fk_id_vendedor = ven.id_vendedor
+      WHERE v.id_venta = ?;
+    `;
 
-  db.query(sqlSelectVenta, [ventaId], (err, result) => {
-    if (err) {
-      res.status(500).json({ error: err.code + ': ' + err.sqlMessage });
-      return;
-    }
+    const [result] = await db.query(sqlSelectVenta, [ventaId]);
 
     if (result.length > 0) {
       const venta = {
@@ -126,28 +82,29 @@ router.get('/get-venta/:id', (req, res) => {
     } else {
       res.status(404).json({ message: 'Venta no encontrada' });
     }
-  });
+  } catch (err) {
+    console.error('Error al obtener la venta:', err);
+    res.status(500).json({ error: 'Error al obtener la venta' });
+  }
 });
 
 // Ruta para buscar ventas por vendedor
-router.get('/get-ventas/vendedor/:id', (req, res) => {
-  const id_vendedor = req.params.id;
+router.get('/get-ventas/vendedor/:id', async (req, res) => {
+  try {
+    const db = await poolPromise; // Espera a que la pool esté lista
+    const id_vendedor = req.params.id;
 
-  const sqlSelect = `
-    SELECT v.id_venta, v.fecha, v.nombre_cliente, ven.nombre AS vendedor,
-           p.nombre AS producto, p.descripcion, ped.cantidad, p.precio, v.estado
-    FROM Venta v
-    LEFT JOIN Pedido ped ON v.id_venta = ped.fk_id_venta
-    LEFT JOIN Producto p ON ped.fk_id_producto = p.id_producto
-    LEFT JOIN Vendedor ven ON v.fk_id_vendedor = ven.id_vendedor
-    WHERE v.fk_id_vendedor = ?;
-  `;
+    const sqlSelect = `
+      SELECT v.id_venta, v.fecha, v.nombre_cliente, ven.nombre AS vendedor,
+             p.nombre AS producto, p.descripcion, ped.cantidad, p.precio, v.estado
+      FROM Venta v
+      LEFT JOIN Pedido ped ON v.id_venta = ped.fk_id_venta
+      LEFT JOIN Producto p ON ped.fk_id_producto = p.id_producto
+      LEFT JOIN Vendedor ven ON v.fk_id_vendedor = ven.id_vendedor
+      WHERE v.fk_id_vendedor = ?;
+    `;
 
-  db.query(sqlSelect, [id_vendedor], (err, result) => {
-    if (err) {
-      res.status(500).json({ error: err.code + ': ' + err.sqlMessage });
-      return;
-    }
+    const [result] = await db.query(sqlSelect, [id_vendedor]);
 
     if (result.length > 0) {
       const ventasMap = {};
@@ -181,25 +138,27 @@ router.get('/get-ventas/vendedor/:id', (req, res) => {
     } else {
       res.status(404).json({ message: 'No se encontraron ventas para el vendedor especificado' });
     }
-  });
+  } catch (err) {
+    console.error('Error al obtener las ventas por vendedor:', err);
+    res.status(500).json({ error: 'Error al obtener las ventas por vendedor' });
+  }
 });
 
 // Ruta para obtener todas las ventas
-router.get('/get-ventas', (req, res) => {
-  const sqlSelectAll = `
-    SELECT v.id_venta, v.fecha, v.nombre_cliente, ven.nombre AS vendedor,
-           p.nombre AS producto, p.descripcion, ped.cantidad, p.precio, v.estado
-    FROM Venta v
-    LEFT JOIN Pedido ped ON v.id_venta = ped.fk_id_venta
-    LEFT JOIN Producto p ON ped.fk_id_producto = p.id_producto
-    LEFT JOIN Vendedor ven ON v.fk_id_vendedor = ven.id_vendedor;
-  `;
+router.get('/get-ventas', async (req, res) => {
+  try {
+    const db = await poolPromise; // Espera a que la pool esté lista
 
-  db.query(sqlSelectAll, (err, result) => {
-    if (err) {
-      res.status(500).json({ error: err.code + ': ' + err.sqlMessage });
-      return;
-    }
+    const sqlSelectAll = `
+      SELECT v.id_venta, v.fecha, v.nombre_cliente, ven.nombre AS vendedor,
+             p.nombre AS producto, p.descripcion, ped.cantidad, p.precio, v.estado
+      FROM Venta v
+      LEFT JOIN Pedido ped ON v.id_venta = ped.fk_id_venta
+      LEFT JOIN Producto p ON ped.fk_id_producto = p.id_producto
+      LEFT JOIN Vendedor ven ON v.fk_id_vendedor = ven.id_vendedor;
+    `;
+
+    const [result] = await db.query(sqlSelectAll);
 
     if (result.length > 0) {
       const ventasMap = {};
@@ -233,28 +192,29 @@ router.get('/get-ventas', (req, res) => {
     } else {
       res.status(404).json({ message: 'No se encontraron ventas' });
     }
-  });
+  } catch (err) {
+    console.error('Error al obtener todas las ventas:', err);
+    res.status(500).json({ error: 'Error al obtener todas las ventas' });
+  }
 });
 
 // Ruta para obtener las ventas filtradas por estado
-router.get('/get-ventas/estado/:estado', (req, res) => {
-  const estado = req.params.estado;
+router.get('/get-ventas/estado/:estado', async (req, res) => {
+  try {
+    const db = await poolPromise; // Espera a que la pool esté lista
+    const estado = req.params.estado;
 
-  const sqlSelectByEstado = `
-    SELECT v.id_venta, v.fecha, v.nombre_cliente, ven.nombre AS vendedor,
-            p.nombre AS producto, p.descripcion, ped.cantidad, p.precio, v.estado
-    FROM Venta v
-    INNER JOIN Pedido ped ON v.id_venta = ped.fk_id_venta
-    INNER JOIN Producto p ON ped.fk_id_producto = p.id_producto
-    INNER JOIN Vendedor ven ON v.fk_id_vendedor = ven.id_vendedor
-    WHERE v.estado = ?;
-  `;
+    const sqlSelectByEstado = `
+      SELECT v.id_venta, v.fecha, v.nombre_cliente, ven.nombre AS vendedor,
+             p.nombre AS producto, p.descripcion, ped.cantidad, p.precio, v.estado
+      FROM Venta v
+      LEFT JOIN Pedido ped ON v.id_venta = ped.fk_id_venta
+      LEFT JOIN Producto p ON ped.fk_id_producto = p.id_producto
+      LEFT JOIN Vendedor ven ON v.fk_id_vendedor = ven.id_vendedor
+      WHERE v.estado = ?;
+    `;
 
-  db.query(sqlSelectByEstado, [estado], (err, result) => {
-    if (err) {
-      res.status(500).json({ error: err.code + ': ' + err.sqlMessage });
-      return;
-    }
+    const [result] = await db.query(sqlSelectByEstado, [estado]);
 
     if (result.length > 0) {
       const ventasMap = {};
@@ -271,13 +231,15 @@ router.get('/get-ventas/estado/:estado', (req, res) => {
           };
         }
 
-        ventasMap[row.id_venta].pedidos.push({
-          producto: row.producto,
-          descripcion: row.descripcion,
-          cantidad: row.cantidad,
-          precio_unitario: row.precio,
-          total: row.cantidad * row.precio
-        });
+        if (row.producto) {
+          ventasMap[row.id_venta].pedidos.push({
+            producto: row.producto,
+            descripcion: row.descripcion,
+            cantidad: row.cantidad,
+            precio_unitario: row.precio,
+            total: row.cantidad * row.precio
+          });
+        }
       });
 
       const ventas = Object.values(ventasMap);
@@ -285,8 +247,76 @@ router.get('/get-ventas/estado/:estado', (req, res) => {
     } else {
       res.status(404).json({ message: 'No se encontraron ventas con el estado especificado' });
     }
-  });
+  } catch (err) {
+    console.error('Error al obtener ventas por estado:', err);
+    res.status(500).json({ error: 'Error al obtener ventas por estado' });
+  }
 });
 
+
+// Ruta para obtener pedidos en un intervalo de fechas
+router.get('/get-ventas/fechas', async (req, res) => {
+  try {
+    const db = await poolPromise; // Espera a que la pool esté lista
+    const { fecha_inicio, fecha_fin } = req.body;
+
+    // Validación de los parámetros de fecha
+    if (!fecha_inicio || !fecha_fin) {
+      return res.status(400).json({ message: 'Debe proporcionar fecha de inicio y fecha de fin.' });
+    }
+
+    // Validación de que la fecha final no sea anterior a la fecha inicial
+    if (new Date(fecha_fin) < new Date(fecha_inicio)) {
+      return res.status(400).json({ message: 'La fecha final no puede ser anterior a la fecha de inicio.' });
+    }
+
+    const sqlSelectPedidos = `
+      SELECT v.id_venta, v.fecha, v.nombre_cliente, ven.nombre AS vendedor,
+             p.nombre AS producto, p.descripcion, ped.cantidad, p.precio
+      FROM Venta v
+      LEFT JOIN Pedido ped ON v.id_venta = ped.fk_id_venta
+      LEFT JOIN Producto p ON ped.fk_id_producto = p.id_producto
+      LEFT JOIN Vendedor ven ON v.fk_id_vendedor = ven.id_vendedor
+      WHERE v.fecha BETWEEN ? AND ?;
+    `;
+
+    const [result] = await db.query(sqlSelectPedidos, [fecha_inicio, fecha_fin]);
+
+    if (result.length > 0) {
+      const pedidosMap = {};
+
+      // Agrupar las ventas y sus pedidos
+      result.forEach(row => {
+        if (!pedidosMap[row.id_venta]) {
+          pedidosMap[row.id_venta] = {
+            id_venta: row.id_venta,
+            fecha: row.fecha,
+            nombre_cliente: row.nombre_cliente,
+            vendedor: row.vendedor,
+            pedidos: []
+          };
+        }
+
+        if (row.producto) {
+          pedidosMap[row.id_venta].pedidos.push({
+            producto: row.producto,
+            descripcion: row.descripcion,
+            cantidad: row.cantidad,
+            precio_unitario: row.precio,
+            total: row.cantidad * row.precio
+          });
+        }
+      });
+
+      const pedidos = Object.values(pedidosMap);
+      res.status(200).json({ pedidos });
+    } else {
+      res.status(404).json({ message: 'No se encontraron pedidos en el intervalo de fechas especificado' });
+    }
+  } catch (err) {
+    console.error('Error al obtener pedidos en el intervalo de fechas:', err);
+    res.status(500).json({ error: 'Error al obtener pedidos en el intervalo de fechas' });
+  }
+});
 
 module.exports = router;
